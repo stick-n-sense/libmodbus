@@ -2134,13 +2134,26 @@ static int _modbus_rpi_pin_export_direction(int debug, int rpi_bcm_pin)
     static const char s_directions_str[] = "out";
     char path[RPI_DIRECTION_MAX];
     snprintf(path, RPI_DIRECTION_MAX, "/sys/class/gpio/gpio%d/direction", rpi_bcm_pin);
-    fd = open(path, O_WRONLY);
-    if (-1 == fd) {
-        if (debug) {
-            fprintf(stderr, "Failed to open gpio direction for writing!\n");
+
+    unsigned int retries_left = 30;
+    while (1)
+    {
+        fd = open(path, O_WRONLY);
+        if (fd != -1) {
+            break;
         }
-        return -1;
+
+        if ((errno != EACCES) || (retries_left-- == 0)) {
+            fprintf(stderr, "Failed to open gpio direction for writing!\n");
+            return -1;
+        }
+
+        const struct timespec rqt = { .tv_sec  = 0, .tv_nsec = 1000000L * (100 % 1000) };
+        if (nanosleep(&rqt, NULL) == -1) {
+            perror("nanosleep");
+        }
     }
+
     if (-1 == write(fd, &s_directions_str, 3)) {
         if (debug) {
             fprintf(stderr, "Failed to set direction!\n");
