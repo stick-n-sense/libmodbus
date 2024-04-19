@@ -5,6 +5,8 @@
  *
  * This library implements the Modbus protocol.
  * http://libmodbus.org/
+ *
+ * Raspberry pi fork of libmodbus with GPIO rx-tx functionality for RS485
  */
 
 #include <errno.h>
@@ -18,6 +20,10 @@
 #include <unistd.h>
 #endif
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <config.h>
 
 #include "modbus-private.h"
@@ -25,6 +31,10 @@
 
 /* Internal use */
 #define MSG_LENGTH_UNDEFINED -1
+
+/* pi related defines */
+#define RPI_DIRECTION_MAX 35
+#define RPI_BUFFER_MAX 3
 
 /* Exported version */
 const unsigned int libmodbus_version_major = LIBMODBUS_VERSION_MAJOR;
@@ -2068,3 +2078,201 @@ size_t strlcpy(char *dest, const char *src, size_t dest_size)
     return (s - src - 1); /* count does not include NUL */
 }
 #endif
+
+/*************************
+ * Rpi related dev API
+ **************************/
+
+int modbus_enable_rpi(modbus_t *ctx, uint8_t value)
+{
+    if (value == 1) {
+        ctx->enable_rpi_rtu = value;
+        if (ctx->debug) {
+            fprintf(stderr, "Rpi RTU enabled.\n");
+        }
+    } else {
+        ctx->enable_rpi_rtu = 0;
+    }
+    return ctx->enable_rpi_rtu;
+}
+
+int modbus_configure_rpi_bcm_pin(modbus_t *ctx, uint8_t value)
+{
+    return modbus_configure_rpi_bcm_pins(ctx, value, value);
+}
+
+int modbus_configure_rpi_bcm_pins(modbus_t *ctx, uint8_t de, uint8_t re)
+{
+    ctx->rpi_bcm_pin_re = re;
+    ctx->rpi_bcm_pin_de = de;
+    if (ctx->debug) {
+        fprintf(stderr,
+                "BCM Pin DE set as %d and pin RE set as %d.\n",
+                ctx->rpi_bcm_pin_de,
+                ctx->rpi_bcm_pin_re);
+    }
+    return 0;
+}
+
+static int _modbus_rpi_pin_export_direction(int debug, int rpi_bcm_pin)
+{
+    // export GPIO code
+    char buffer[RPI_BUFFER_MAX];
+    ssize_t bytes_written;
+    int fd;
+    fd = open("/sys/class/gpio/export", O_WRONLY);
+    if (-1 == fd) {
+        if (debug) {
+            fprintf(stderr, "Failed to open export for writing!\n");
+        }
+        return -1;
+    }
+    bytes_written = snprintf(buffer, RPI_BUFFER_MAX, "%d", rpi_bcm_pin);
+    write(fd, buffer, bytes_written);
+    close(fd);
+    // set GPIO direction code
+    static const char s_directions_str[] = "out";
+    char path[RPI_DIRECTION_MAX];
+    snprintf(path, RPI_DIRECTION_MAX, "/sys/class/gpio/gpio%d/direction", rpi_bcm_pin);
+    fd = open(path, O_WRONLY);
+    if (-1 == fd) {
+        if (debug) {
+            fprintf(stderr, "Failed to open gpio direction for writing!\n");
+        }
+        return -1;
+    }
+    if (-1 == write(fd, &s_directions_str, 3)) {
+        if (debug) {
+            fprintf(stderr, "Failed to set direction!\n");
+        }
+        return -1;
+    }
+    close(fd);
+    if (debug) {
+        fprintf(stderr, "RPI pin exported and pin direction configured successfully.\n");
+    }
+
+    return 0;
+}
+
+static int _modbus_rpi_pin_unexport_direction(int debug, int rpi_bcm_pin)
+{
+    // set GPIO direction code
+    static const char s_directions_str[] = "in";
+    char path[RPI_DIRECTION_MAX];
+    int fd;
+    snprintf(path, RPI_DIRECTION_MAX, "/sys/class/gpio/gpio%d/direction", rpi_bcm_pin);
+    fd = open(path, O_WRONLY);
+    if (-1 == fd) {
+        if (debug) {
+            fprintf(stderr, "Failed to open gpio direction for writing!\n");
+        }
+        return -1;
+    }
+    if (-1 == write(fd, &s_directions_str, 2)) {
+        if (debug) {
+            fprintf(stderr, "Failed to set direction!\n");
+        }
+        return -1;
+    }
+    close(fd);
+    // unexport GPIO code
+    char buffer[RPI_BUFFER_MAX];
+    ssize_t bytes_written;
+    fd = open("/sys/class/gpio/unexport", O_WRONLY);
+    if (-1 == fd) {
+        if (debug) {
+            fprintf(stderr, "Failed to open export for writing!\n");
+        }
+        return -1;
+    }
+    bytes_written = snprintf(buffer, RPI_BUFFER_MAX, "%d", rpi_bcm_pin);
+    write(fd, buffer, bytes_written);
+    close(fd);
+    if (debug) {
+        fprintf(stderr, "RPI BCM Pin Unexported successfully.\n");
+    }
+
+    return 0;
+}
+
+int modbus_rpi_pin_export_direction(modbus_t *ctx)
+{
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (ctx->enable_rpi_rtu == 1) {
+        if (_modbus_rpi_pin_export_direction(ctx->debug, ctx->rpi_bcm_pin_re) == 0) {
+            return _modbus_rpi_pin_export_direction(ctx->debug, ctx->rpi_bcm_pin_de);
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+modbus_t *modbus_mm_open(const char *device,
+                         int baud,
+                         char parity,
+                         int data_bit,
+                         int stop_bit,
+                         uint8_t de,
+                         uint8_t re,
+                         uint32_t to_sec,
+                         uint32_t to_usec)
+{
+    modbus_t *ctx = NULL;
+    ctx = modbus_new_rtu(device, baud, parity, data_bit, stop_bit);
+    if (ctx == NULL) {
+        return NULL;
+    }
+    modbus_set_error_recovery(
+        ctx, MODBUS_ERROR_RECOVERY_LINK | MODBUS_ERROR_RECOVERY_PROTOCOL);
+    modbus_set_response_timeout(ctx, to_sec, to_usec);
+    modbus_enable_rpi(ctx, TRUE);
+    modbus_configure_rpi_bcm_pins(ctx, de, re);
+    if (modbus_rpi_pin_export_direction(ctx)) {
+        modbus_mm_close(ctx);
+        errno = EINVAL;
+        return NULL;
+    }
+    if (modbus_connect(ctx) == -1) {
+        int _errno = errno;
+        modbus_mm_close(ctx);
+        errno = _errno;
+        return NULL;
+    }
+    return ctx;
+}
+
+int modbus_mm_close(modbus_t *ctx)
+{
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* Close the connection */
+    int ret = modbus_rpi_pin_unexport_direction(ctx);
+    modbus_close(ctx);
+    modbus_free(ctx);
+    return ret;
+}
+
+int modbus_rpi_pin_unexport_direction(modbus_t *ctx)
+{
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (ctx->enable_rpi_rtu == 1) {
+        if (_modbus_rpi_pin_unexport_direction(ctx->debug, ctx->rpi_bcm_pin_re) == 0) {
+            return _modbus_rpi_pin_unexport_direction(ctx->debug, ctx->rpi_bcm_pin_de);
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}

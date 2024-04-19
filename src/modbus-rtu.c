@@ -2,6 +2,7 @@
  * Copyright © Stéphane Raimbault <stephane.raimbault@gmail.com>
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Raspberry pi fork of libmodbus with GPIO rx-tx functionality for RS485
  */
 
 #include <errno.h>
@@ -11,12 +12,19 @@
 #include <string.h>
 #ifndef _MSC_VER
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #endif
 #include "modbus-private.h"
 #include <assert.h>
 
 #include "modbus-rtu-private.h"
 #include "modbus-rtu.h"
+
+//rpi related defines
+#define RPI_VALUE_MAX 30
+#define RPI_HIGH 1
+#define RPI_LOW 0
 
 #if HAVE_DECL_TIOCSRS485 || HAVE_DECL_TIOCM_RTS
 #include <sys/ioctl.h>
@@ -252,39 +260,80 @@ static void _modbus_rtu_ioctl_rts(modbus_t *ctx, int on)
 }
 #endif
 
+static int _set_GPIO_value(int debug, int pin, int value)
+{
+    static const char s_values_str[] = "01";
+    char path[RPI_VALUE_MAX];
+    int fd;
+    snprintf(path, RPI_VALUE_MAX, "/sys/class/gpio/gpio%d/value", pin);
+    fd = open(path, O_WRONLY);
+    if (-1 == fd) {
+        if (debug) {
+            fprintf(stderr, "Failed to open gpio value for writing!\n");
+        }
+        return -1;
+    }
+    if (1 != write(fd, &s_values_str[value], 1)) {
+        if (debug) {
+            fprintf(stderr, "Failed to write value!\n");
+        }
+        return -1;
+    }
+    close(fd);
+    if (debug) {
+        fprintf(stderr, "GPIO%d written : %d successfully !\n", pin, value);
+    }
+    return 0;
+}
+
+static int _set_GPIO_pin(modbus_t *ctx, int value)
+{
+    if (ctx->enable_rpi_rtu == 1) {
+        if (_set_GPIO_value(ctx->debug, ctx->rpi_bcm_pin_re, value) == 0) {
+            return _set_GPIO_value(ctx->debug, ctx->rpi_bcm_pin_de, value);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static ssize_t _modbus_rtu_send(modbus_t *ctx, const uint8_t *req, int req_length)
 {
-#if defined(_WIN32)
     modbus_rtu_t *ctx_rtu = ctx->backend_data;
+#if defined(_WIN32)
     DWORD n_bytes = 0;
     return (WriteFile(ctx_rtu->w_ser.fd, req, req_length, &n_bytes, NULL))
                ? (ssize_t) n_bytes
                : -1;
 #else
+    ssize_t size;
 #if HAVE_DECL_TIOCM_RTS
-    modbus_rtu_t *ctx_rtu = ctx->backend_data;
     if (ctx_rtu->rts != MODBUS_RTU_RTS_NONE) {
-        ssize_t size;
 
         if (ctx->debug) {
             fprintf(stderr, "Sending request using RTS signal\n");
         }
 
+        _set_GPIO_pin(ctx, RPI_HIGH);
         ctx_rtu->set_rts(ctx, ctx_rtu->rts == MODBUS_RTU_RTS_UP);
         usleep(ctx_rtu->rts_delay);
 
         size = write(ctx->s, req, req_length);
 
         usleep(ctx_rtu->onebyte_time * req_length + ctx_rtu->rts_delay);
-        ctx_rtu->set_rts(ctx, ctx_rtu->rts != MODBUS_RTU_RTS_UP);
 
-        return size;
+        _set_GPIO_pin(ctx, RPI_LOW);
+        ctx_rtu->set_rts(ctx, ctx_rtu->rts != MODBUS_RTU_RTS_UP);
     } else {
 #endif
-        return write(ctx->s, req, req_length);
+        _set_GPIO_pin(ctx, RPI_HIGH);
+        size = write(ctx->s, req, req_length);
+        usleep(ctx_rtu->onebyte_time * req_length);
+        _set_GPIO_pin(ctx, RPI_LOW);
 #if HAVE_DECL_TIOCM_RTS
     }
 #endif
+    return size;
 #endif
 }
 
